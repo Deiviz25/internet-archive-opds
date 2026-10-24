@@ -156,10 +156,27 @@ function pickBestFile(files = []) {
   return null;
 }
 
+// Caché explícita (Cache API) para que los metadatos se reutilicen entre peticiones.
+async function cachedJson(url, ttl) {
+  const cache = caches.default;
+  const key = new Request(url);
+  const hit = await cache.match(key);
+  if (hit) return hit.json();
+
+  const data = await getJson(url, ttl);
+  await cache.put(
+    key,
+    new Response(JSON.stringify(data), {
+      headers: { "cache-control": `public, max-age=${ttl}` },
+    })
+  );
+  return data;
+}
+
 // Devuelve null si el identificador no existe en Internet Archive.
 // Lanza error si hay fallo de red o de servicio.
 async function getItem(id) {
-  const data = await getJson(IA.meta + encodeURIComponent(id), CFG.itemTtl);
+  const data = await cachedJson(IA.meta + encodeURIComponent(id), CFG.itemTtl);
   if (!data || (!data.metadata && !data.files)) return null;
 
   const m = data.metadata || {};

@@ -217,7 +217,8 @@ function entryXml(b, origin, detail) {
   x += link("alternate", IA.details + encodeURIComponent(b.id), "text/html", "Ficha en Internet Archive");
 
   if (b.dl) {
-    const href = IA.download + encodeURIComponent(b.id) + "/" + encodeURIComponent(b.dl.file);
+    // Se descarga a través del worker para que el archivo llegue con cabeceras CORS.
+    const href = `${origin}/opds/file/${encodeURIComponent(b.id)}/${encodeURIComponent(b.dl.file)}`;
     x += link("http://opds-spec.org/acquisition/open-access", href, b.dl.mime, `Descargar ${b.dl.label}`);
   }
   if (!detail) {
@@ -367,6 +368,36 @@ function openSearch(origin) {
   );
 }
 
+// Reenvía el archivo de Internet Archive añadiendo CORS y soporte de rangos (necesario para CBZ/EPUB en lectores web).
+async function proxyFile(request, id, name) {
+  const headers = { "user-agent": "IA-OPDS/2.0 (catálogo personal de solo lectura)" };
+  const range = request.headers.get("range");
+  if (range) headers.range = range;
+
+  const url = IA.download + encodeURIComponent(id) + "/" + encodeURIComponent(name);
+  const r = await fetch(url, {
+    method: request.method,
+    headers,
+    redirect: "follow",
+    signal: AbortSignal.timeout(30000),
+  });
+
+  if (!r.ok && r.status !== 206) {
+    return text(`No se pudo obtener el archivo (${r.status})`, 502);
+  }
+
+  const out = new Headers();
+  for (const k of ["content-type", "content-length", "content-range", "accept-ranges", "last-modified", "etag"]) {
+    const v = r.headers.get(k);
+    if (v) out.set(k, v);
+  }
+  out.set("content-disposition", `attachment; filename*=UTF-8''${encodeURIComponent(name)}`);
+  out.set("access-control-allow-origin", "*");
+  out.set("access-control-expose-headers", "content-length, content-range, accept-ranges");
+  out.set("cache-control", "public, max-age=86400");
+  return new Response(request.method === "HEAD" ? null : r.body, { status: r.status, headers: out });
+}
+
 function safeDecode(s) {
   try {
     return decodeURIComponent(s);
@@ -378,6 +409,17 @@ function safeDecode(s) {
 // ---------- Rutas ----------
 export default {
   async fetch(request) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, HEAD",
+          "access-control-allow-headers": "range",
+          "access-control-max-age": "86400",
+        },
+      });
+    }
     if (request.method !== "GET" && request.method !== "HEAD") {
       return text("Método no permitido", 405);
     }
@@ -428,6 +470,16 @@ export default {
           page,
         });
         return respond(r.xml, { maxAge: r.failed ? 0 : 300 });
+      }
+
+      const fileMatch = path.match(/^\/opds\/file\/([^/]+)\/([^/]+)$/);
+      if (fileMatch) {
+        const id = safeDecode(fileMatch[1]);
+        const name = safeDecode(fileMatch[2]);
+        if (!id || !ID_RE.test(id) || !name || !/\.(epub|pdf|cbz)$/i.test(name) || name.includes("/")) {
+          return text("Archivo no válido", 400);
+        }
+        return proxyFile(request, id, name);
       }
 
       const itemMatch = path.match(/^\/opds\/item\/([^/]+)\.xml$/);

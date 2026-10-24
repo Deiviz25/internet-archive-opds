@@ -23,8 +23,9 @@ const CFG = {
   maxQuery: 100,
   searchTtl: 900,
   itemTtl: 86400,
-  concurrency: 4,
-  timeoutMs: 10000,
+  concurrency: 8,
+  timeoutMs: 5000,
+  budgetMs: 8000, // tiempo máximo para cargar los ítems de una lista
 };
 
 const DEFAULT_QUERY =
@@ -274,12 +275,16 @@ async function listing({ origin, path, params = {}, mode, title, page }) {
   let entries = "";
   let subtitle = "";
   let failed = false;
+  const deadline = Date.now() + CFG.budgetMs;
 
   try {
     const { ids, total: t } = await searchIds({ q: params.q, mode, page: p });
     total = t;
 
     const results = await mapLimit(ids, CFG.concurrency, async (id) => {
+      // Si se agota el presupuesto, se omite el resto: la respuesta llega a tiempo
+      // y no se cachea, así que al recargar se completa con los metadatos ya cacheados.
+      if (Date.now() > deadline) return { error: true };
       try {
         return { book: await getItem(id) };
       } catch (e) {

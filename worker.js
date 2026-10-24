@@ -37,7 +37,7 @@ const FORMATS = [
   { ext: ".cbz", mime: "application/vnd.comicbook+zip", label: "CBZ" },
 ];
 
-// Versiones derivadas (OCR, baja resolución...) que no queremos como descarga principal.
+// Versiones derivadas (OCR, baja resolución...). Solo se usan si no hay otra opción.
 const DERIVED = /_(text|bw|hocr|djvu|abbyy|chocr|meta)\b/i;
 
 // Identificadores de Internet Archive: letras, números, punto, guion y guion bajo.
@@ -76,7 +76,8 @@ function respond(body, { type = MIME.acq, status = 200, maxAge = 300 } = {}) {
     status,
     headers: {
       "content-type": `${type}; charset=utf-8`,
-      "cache-control": `public, max-age=${maxAge}`,
+      // Sin caché cuando la respuesta es parcial o de error, para no servir fallos durante 5 minutos.
+      "cache-control": maxAge > 0 ? `public, max-age=${maxAge}` : "no-store",
       "access-control-allow-origin": "*",
     },
   });
@@ -146,15 +147,17 @@ function pickBestFile(files = []) {
     );
     if (!candidates.length) continue;
 
-    candidates.sort(
-      (a, b) => (DERIVED.test(a.name) - DERIVED.test(b.name)) || (a.name.length - b.name.length)
-    );
-    return { file: candidates[0].name, mime: fmt.mime, label: fmt.label };
+    // Preferir siempre la versión original; las derivadas solo si no hay otra.
+    const primary = candidates.filter((f) => !DERIVED.test(f.name));
+    const pool = primary.length ? primary : candidates;
+    pool.sort((a, b) => a.name.length - b.name.length);
+    return { file: pool[0].name, mime: fmt.mime, label: fmt.label };
   }
   return null;
 }
 
 // Devuelve null si el identificador no existe en Internet Archive.
+// Lanza error si hay fallo de red o de servicio.
 async function getItem(id) {
   const data = await getJson(IA.meta + encodeURIComponent(id), CFG.itemTtl);
   if (!data || (!data.metadata && !data.files)) return null;
@@ -246,29 +249,40 @@ async function mapLimit(items, limit, fn) {
   return out;
 }
 
+// Devuelve { xml, failed }. failed = true si hubo algún fallo de IA (no se cachea).
 async function listing({ origin, path, params = {}, mode, title, page }) {
   const p = clampPage(page);
   const selfUrl = pageUrl(origin, path, params, p);
   let total = 0;
   let entries = "";
   let subtitle = "";
+  let failed = false;
 
   try {
     const { ids, total: t } = await searchIds({ q: params.q, mode, page: p });
     total = t;
-    const books = await mapLimit(ids, CFG.concurrency, async (id) => {
+
+    const results = await mapLimit(ids, CFG.concurrency, async (id) => {
       try {
-        return await getItem(id);
+        return { book: await getItem(id) };
       } catch (e) {
         console.warn("item", id, e.message);
-        return null;
+        return { error: true };
       }
     });
-    // Solo se listan publicaciones con un archivo descargable verificado en sus metadatos.
-    entries = books.filter((b) => b && b.dl).map((b) => entryXml(b, origin, false)).join("");
-    if (!entries) subtitle = "No hay resultados con descarga directa en esta página.";
+
+    if (results.some((r) => r.error)) failed = true;
+
+    const books = results.map((r) => r.book).filter(Boolean);
+    entries = books.map((b) => entryXml(b, origin, false)).join("");
+
+    if (!ids.length) subtitle = "No hay resultados en esta página.";
+    else if (failed && !books.length) {
+      subtitle = "No se han podido cargar las publicaciones. Inténtalo de nuevo en unos minutos.";
+    }
   } catch (e) {
     console.warn("search", e.message);
+    failed = true;
     subtitle = "Internet Archive no responde ahora. Inténtalo de nuevo en unos minutos.";
   }
 
@@ -278,7 +292,8 @@ async function listing({ origin, path, params = {}, mode, title, page }) {
     links.push(link("next", pageUrl(origin, path, params, p + 1), MIME.acq, "Página siguiente"));
   }
 
-  return feed({ origin, id: selfUrl, title, self: selfUrl, links, entries, subtitle, total, page: p });
+  const xml = feed({ origin, id: selfUrl, title, self: selfUrl, links, entries, subtitle, total, page: p });
+  return { xml, failed };
 }
 
 function rootFeed(origin) {
@@ -371,29 +386,26 @@ export default {
       }
 
       if (path === "/opds/recent.xml") {
-        return respond(
-          await listing({ origin, path: "/opds/recent.xml", mode: "recent", title: "Recientes", page })
-        );
+        const r = await listing({ origin, path: "/opds/recent.xml", mode: "recent", title: "Recientes", page });
+        return respond(r.xml, { maxAge: r.failed ? 0 : 300 });
       }
 
       if (path === "/opds/popular.xml") {
-        return respond(
-          await listing({ origin, path: "/opds/popular.xml", mode: "popular", title: "Populares", page })
-        );
+        const r = await listing({ origin, path: "/opds/popular.xml", mode: "popular", title: "Populares", page });
+        return respond(r.xml, { maxAge: r.failed ? 0 : 300 });
       }
 
       if (path === "/opds/search.xml") {
         if (!q) return text("Falta el término de búsqueda. Ejemplo: /opds/search.xml?q=quijote", 400);
-        return respond(
-          await listing({
-            origin,
-            path: "/opds/search.xml",
-            params: { q },
-            mode: "popular",
-            title: `Resultados para "${q}"`,
-            page,
-          })
-        );
+        const r = await listing({
+          origin,
+          path: "/opds/search.xml",
+          params: { q },
+          mode: "popular",
+          title: `Resultados para "${q}"`,
+          page,
+        });
+        return respond(r.xml, { maxAge: r.failed ? 0 : 300 });
       }
 
       const itemMatch = path.match(/^\/opds\/item\/([^/]+)\.xml$/);
